@@ -11,6 +11,9 @@
  *   DATA_DIR=./data
  *   COOKIE_SECURE=1      (set when serving over HTTPS)
  *   TRUST_PROXY=1        (set when behind nginx/Cloudflare so client IPs are read from X-Forwarded-For)
+ *   SIGNING_KEY_PEM=...  ECDSA P-256 PRIVATE key (PEM). Signs /api/validate answers for the app.
+ *   CONTENT_KEY_B64=...  base64 of 32 random bytes; released only to valid licenses (asset decryption).
+ *   REQUIRE_SIGNED=1     reject old unsigned clients (set once all users updated to the new app)
  */
 const http = require('http');
 const crypto = require('crypto');
@@ -28,6 +31,28 @@ const SESSION_TTL = 1000 * 60 * 60 * 12; // 12h
 const DAY = 86400000;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
+
+/* ------------------------- response signing (app) ------------------------- */
+const REQUIRE_SIGNED = process.env.REQUIRE_SIGNED === '1';
+let SIGNING_KEY = null;
+try {
+  const pem = (process.env.SIGNING_KEY_PEM || '').replace(/\\n/g, '\n');
+  if (pem) SIGNING_KEY = crypto.createPrivateKey(pem);
+} catch (_) { console.error('SIGNING_KEY_PEM is set but invalid'); }
+const CONTENT_KEY_B64 = (Buffer.from(process.env.CONTENT_KEY_B64 || '', 'base64').length === 32)
+  ? process.env.CONTENT_KEY_B64 : '';
+if (!SIGNING_KEY) console.warn('WARNING: SIGNING_KEY_PEM missing/invalid - signed validation disabled');
+if (!CONTENT_KEY_B64) console.warn('WARNING: CONTENT_KEY_B64 missing/invalid (needs base64 of 32 bytes)');
+
+/** Sends a validation answer. Signed envelope when the app sent a nonce, legacy JSON otherwise. */
+function vjson(res, status, obj, cors, ctx) {
+  if (!ctx.signed) return json(res, status, obj, cors);
+  const out = { ...obj, deviceId: ctx.deviceId, nonce: ctx.nonce, iat: Date.now() };
+  if (obj.valid === true) out.ck = CONTENT_KEY_B64; // key only ever leaves for a valid license
+  const payload = JSON.stringify(out);
+  const sig = crypto.sign('sha256', Buffer.from(payload, 'utf8'), SIGNING_KEY).toString('base64');
+  return json(res, status, { payload, sig }, cors);
+}
 
 /* ---------------------------- admin credentials --------------------------- */
 function hashPassword(password, salt) {
@@ -221,28 +246,40 @@ async function handleApi(req, res, pathname) {
     const b = await readBody(req);
     const key = String(b.key || '').trim();
     const deviceId = String(b.deviceId || '').trim().slice(0, 200);
-    if (!key || !deviceId) return json(res, 400, { valid: false, reason: 'bad_request' }, cors);
+
+    // Signed mode: the app sends a random nonce; we echo it (plus deviceId) inside a signed payload.
+    const nonce = typeof b.nonce === 'string' ? b.nonce : '';
+    const rawDevice = typeof b.deviceId === 'string' ? b.deviceId : '';
+    const signed = nonce !== '';
+    if (signed && !(SIGNING_KEY && CONTENT_KEY_B64)) return json(res, 503, { valid: false, reason: 'server_not_configured' }, cors);
+    if (!signed && REQUIRE_SIGNED) return json(res, 400, { valid: false, reason: 'bad_request' }, cors);
+    if (signed && (!/^[A-Za-z0-9_-]{16,64}$/.test(nonce) || rawDevice.length > 200))
+      return json(res, 400, { valid: false, reason: 'bad_request' }, cors);
+    const ctx = { signed, nonce, deviceId: rawDevice };
+    const reply = (status, obj) => vjson(res, status, obj, cors, ctx);
+
+    if (!key || !deviceId) return reply(400, { valid: false, reason: 'bad_request' });
 
     const l = db.licenses.find((x) => x.key.toLowerCase() === key.toLowerCase());
-    if (!l) return json(res, 200, { valid: false, reason: 'not_found' }, cors);
+    if (!l) return reply(200, { valid: false, reason: 'not_found' });
 
     const now = Date.now();
-    if (l.expiresAt != null && now > l.expiresAt) return json(res, 200, { valid: false, reason: 'expired' }, cors);
+    if (l.expiresAt != null && now > l.expiresAt) return reply(200, { valid: false, reason: 'expired' });
 
     let dev = l.devices.find((d) => d.id === deviceId);
     if (!dev) {
-      if (l.devices.length >= l.maxDevices) return json(res, 200, { valid: false, reason: 'device_limit' }, cors);
+      if (l.devices.length >= l.maxDevices) return reply(200, { valid: false, reason: 'device_limit' });
       dev = { id: deviceId, firstSeen: now, lastSeen: now };
       l.devices.push(dev);
     }
     dev.lastSeen = now;
     if (l.expiresAt == null) l.expiresAt = now + l.durationDays * DAY; // start on first use
     save();
-    return json(res, 200, {
+    return reply(200, {
       valid: true, expiresAt: l.expiresAt,
       daysLeft: Math.max(0, Math.ceil((l.expiresAt - now) / DAY)),
       devicesUsed: l.devices.length, maxDevices: l.maxDevices,
-    }, cors);
+    });
   }
 
   // CSRF defence in depth: reject cross-site state-changing admin requests
